@@ -3,18 +3,12 @@
 #include <string.h>
 #include "server_handle_table.h"
 
-// going to use linked lists as my dynamic data structure
-typedef struct Node{
-    char handleName[101];   // max length is 100 + null 
-    int socketNum;
-    struct Node *next;
-} Node;
-
 static Node *head = NULL;   
 static int clientCount = 0; 
 
 // helper func to add client 
 void addHandle(const char *handleName, int socketNum){
+    // printf("Adding handle: %s\n", handleName);
     Node *newNode = (Node *)malloc(sizeof(Node));
 
     // check if null
@@ -30,6 +24,7 @@ void addHandle(const char *handleName, int socketNum){
     newNode->next = head;                           // first node made the next is going to be null 
     head = newNode;                                 // head is initially null so when you make the first node that newNode becomes the new head
     clientCount++;                                  // increment count
+    // printf("New head is: %s\n", head->handleName);
 }
 
 // helper func to remove client
@@ -62,7 +57,6 @@ char* getHandle(int socketNum){
 
     while(curr != NULL){
         if(curr->socketNum == socketNum){
-            
             return curr->handleName;
         }
         curr = curr->next;
@@ -82,13 +76,7 @@ int findHandle(const char *handleName){
     return -1;
 }
 
-// prints out the number of clients and their names
-void printHandle(){
-    printf("Number of clients: %d", clientCount);
-    
-    Node *curr = head;
-    while(curr != NULL){
-        printf("    %s\n", curr->handleName);
-        curr = curr->next;
-    }
+
+Node *getHead(){
+    return head;
 }

@@ -20,7 +20,6 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <stdint.h>
-
 #include "networks.h"
 #include "safeUtil.h"
 #include "new.h"
@@ -34,22 +33,20 @@ int checkArgs(int argc, char *argv[]);
 void addNewSocket(int mainServerSocket);
 void processClient(int clientSocket);
 void serverControl(int mainServerSocket);
-// void sendHandleToClient(int clientSocket);
-void forwardMessage(int clientSocket, uint8_t *buffer, int length);
-void sendHandleError(int clientSocket, const char *destHandle);
-
-
-
+void sendPacket(int socketNum, uint8_t *payloadBuf, int payloadLen);
+void forwardDm(int socketNum, uint8_t *msgBuffer, int msgLen);
+void handleDNE(int socketNum, const char *destHandle);
+void forwardMulticast(int socketNum, uint8_t *msgBuffer, int msgLen);
+void sendHandles(int socketNum);
+void forwardBroadcast(uint8_t *msgBuffer, int msgLen);
 
 // to handle closing the server with multiple clients
 volatile int activeClients = 0;
 
 int main(int argc, char *argv[]){
 	int mainServerSocket = 0;   //socket descriptor for the server socket
-	// int clientSocket = 0;   //socket descriptor for the client socket
 	int portNumber = 0;
 	portNumber = checkArgs(argc, argv);
-	//create the server socket
 	mainServerSocket = tcpServerSetup(portNumber);
 	serverControl(mainServerSocket);
 	close(mainServerSocket);
@@ -60,14 +57,12 @@ int checkArgs(int argc, char *argv[]){
 	// Checks args and returns port number
 	int portNumber = 0;
 
-	if (argc > 2)
-	{
+	if(argc > 2){
 		fprintf(stderr, "Usage %s [optional port number]\n", argv[0]);
 		exit(-1);
 	}
 	
-	if (argc == 2)
-	{
+	if(argc == 2){
 		portNumber = atoi(argv[1]);
 	}
 	
@@ -99,6 +94,7 @@ void serverControl(int mainServerSocket){
     close(mainServerSocket);
 }
 
+// adds new socket and adds to linkedlist
 void addNewSocket(int mainServerSocket){
 	// new client is trying to connect -> accept 
 	int newClientSocket = tcpAccept(mainServerSocket, DEBUG_FLAG);
@@ -108,34 +104,54 @@ void addNewSocket(int mainServerSocket){
 		return;
 	}
 
+	uint8_t responseBuf[MAXBUF];
+	int responseLen = recvPDU(newClientSocket, responseBuf, MAXBUF);
 
+	if (responseLen < 2) {
+		printf("Initial packet needs at least 2 bytes");
+		close(newClientSocket);
+		return;
+    }
 
-	// receive the handle from the client -> get it from the socket triggered, put that data in buffer, size of the buffer
-	uint8_t handleBuffer[MAX_HANDLE_LEN];
-	int handleLen = recvPDU(newClientSocket, handleBuffer, MAX_HANDLE_LEN);
+	// uint8_t flag = responseBuf[0];
+	uint8_t handleLen = responseBuf[1];
+	char clientHandle[MAX_HANDLE_LEN];
+    memcpy(clientHandle, responseBuf + 2, handleLen);
+    clientHandle[handleLen] = '\0';
 
-	// // ensure that the received msg is > 0 else close the socket and remove from poll set
-	if (handleLen < 0) {
-        printf("Failed to receive handle from client\n");
-        removeFromPollSet(newClientSocket);
+	// check to see if the handle exists
+	if(findHandle(clientHandle) != -1) {
+        uint8_t response[3];
+        response[0] = 3;         	// flag = 3 (error)
+        response[1] = handleLen;   	
+        memcpy(response + 2, clientHandle, handleLen);
+        sendPDU(newClientSocket, response, 2 + handleLen);
         close(newClientSocket);
         return;
     }
 
-	handleBuffer[handleLen] = '\0';	
+	// add to linked list
+	addHandle(clientHandle, newClientSocket);
+    // printf("Handle added to linked list: %s\n", clientHandle);
+	// printHandle();
 
-	// add to poll set
-	// add handle to linked list
-	addHandle((char *) handleBuffer, newClientSocket);
-	printf("Handle added to linked list: %s\n", (char *)handleBuffer);
-	addToPollSet(newClientSocket);
-	activeClients++;
+    uint8_t successResponse[1];
+    successResponse[0] = 2;  	// flag = 2 indicates success
+	// printf("Flag is set to 2");
+    if(sendPDU(newClientSocket, successResponse, 1) < 0) {
+        perror("Failed to send success response");
+        close(newClientSocket);
+        return;
+    }
+
+    // Add the new client to the poll set for future messages
+    addToPollSet(newClientSocket);
+    activeClients++;
 }
 
 void processClient(int clientSocket) {
     uint8_t buffer[MAXBUF];
     int bytesReceived;
-
 	bytesReceived = recvPDU(clientSocket, buffer, MAXBUF);
 
 	// when the client hits Control C remove the socket from the poll set
@@ -148,7 +164,6 @@ void processClient(int clientSocket) {
 		if (activeClients == 0) {
             exit(0); 
         }
-
 		return;
 	}
 
@@ -161,171 +176,202 @@ void processClient(int clientSocket) {
 		if (activeClients == 0) {
             exit(0); 
         }
-
 		return;
 	}
 
-	uint8_t flag = buffer[2];
+	// printf("Message received on socket %d, length: %d Data: %s\n", clientSocket, bytesReceived, buffer);
 
-	printf("Flag is: %d\n", flag);
+	// check what kind of message is being sent to server
+	uint8_t flag = buffer[0];
+	// printf("Flag is: %d\n", flag);
 
-    if (flag == 5) {  // %M (Private Message)
-        printf("Received private message request from client %d\n", clientSocket);
-        forwardMessage(clientSocket, buffer, bytesReceived);
-    }
-
-	printf("DEBUG: Received Packet (Hex Dump):\n");
-	for (int i = 0; i < bytesReceived; i++) {
-		printf("%02X ", buffer[i]);
+	switch(flag){
+		case 5:
+			forwardDm(clientSocket, buffer, bytesReceived);
+			break;
+		case 6:
+			forwardMulticast(clientSocket, buffer, bytesReceived);
+			break;
+		case 10:
+			sendHandles(clientSocket);
+			break;
+		case 4:
+			forwardBroadcast(buffer, bytesReceived);
+			break;
+		default:
+			printf("Unknown flag\n");
+			break;
 	}
-	printf("\n");
-
-
-
-	printf("Message received on socket %d, length: %d Data: %s\n", clientSocket, bytesReceived, buffer);
-
-	// sendHandleToClient(clientSocket);
-
-
-	// char *senderHandle = getHandle(clientSocket); 
-	// printf("Socket Number: %d\n", clientSocket);
-	// printf("Here is the sender handle: %s\n", senderHandle);
-
-
-
-	// if i remove this line i can no longer continuosly repeat the message
-	// echo message back to the client
-	// sendPDU(clientSocket, buffer, bytesReceived);
-
 }
 
-// void sendHandleToClient(int clientSocket){
-// 	uint8_t senderHandleBuffer[MAX_HANDLE_LEN];
-// 	char *senderHandle = getHandle(clientSocket);
-// 	if (!senderHandle) {
-//         printf("Error: Sender handle not found for socket %d\n", clientSocket);
-//         return;
-//     }
-
-// 	snprintf((char *)senderHandleBuffer, sizeof(senderHandleBuffer), "%s", senderHandle);  // Copy handle safely
-// 	printf("Socket Number: %d\n", clientSocket);
-// 	printf("Here is the sender handle: %s\n", senderHandle);
-// 	printf("here is the buffer: %s\n", senderHandleBuffer);
-// 	sendPDU(clientSocket, senderHandleBuffer, strlen((char *)senderHandleBuffer + 1));
-// }
-
-// void sendHandleToClient(int clientSocket) {
-//     uint8_t sendBuf[MAXBUF];
-//     uint8_t flag = 12;  // Flag for private messages
-//     char *senderHandle = getHandle(clientSocket);
-    
-//     if (!senderHandle) {
-//         printf("Error: Sender handle not found for socket %d\n", clientSocket);
-//         return;
-//     }
-
-//     uint8_t senderHandleLen = strlen(senderHandle);
-//     uint16_t totalLen = htons(3 + senderHandleLen);  // 3-byte header + handle length
-
-//     int index = 0;
-
-//     // Add 2-byte message length
-//     memcpy(&sendBuf[index], &totalLen, 2);
-//     index += 2;
-
-//     // Add 1-byte flag
-//     sendBuf[index++] = flag;
-
-//     // Add sender handle length
-//     sendBuf[index++] = senderHandleLen;
-
-//     // Add sender handle
-//     memcpy(&sendBuf[index], senderHandle, senderHandleLen);
-//     index += senderHandleLen;
-
-//     printf("Socket Number: %d\n", clientSocket);
-//     printf("Sending handle: %s (Len: %d)\n", senderHandle, senderHandleLen);
-// 	printf("the buffer should be %s\n", sendBuf);
-
-//     // Send the properly formatted message
-//     sendPDU(clientSocket, sendBuf, ntohs(totalLen));
-// }
-
-
-// void fowardMessage(int clientSocket, uint8_t *buffer, int length){
-// 	char *senderHandle = getHandle(clientSocket);
-//     if (!senderHandle) {
-//         printf("Error: Sender handle not found for socket %d\n", clientSocket);
-//         return;
-//     }
-
-//     // Extract sender and recipient handle lengths
-//     uint8_t senderHandleLen = buffer[3];
-//     uint8_t destHandleLen = buffer[4 + senderHandleLen];
-
-//     // Extract recipient handle
-//     char destHandle[100];
-//     strncpy(destHandle, (char*)&buffer[5 + senderHandleLen], destHandleLen);
-//     destHandle[destHandleLen] = '\0';
-
-//     // Find recipient’s socket
-//     int destSocket = findHandle(destHandle);
-//     if (destSocket == -1) {
-//         sendHandleError(clientSocket, destHandle);
-//         return;
-//     }
-
-//     // Forward message ONLY to recipient, NOT back to sender
-//     sendPDU(destSocket, buffer, length);
-//     printf("Forwarded message from %s to %s\n", senderHandle, destHandle);
-// }
-
-void forwardMessage(int clientSocket, uint8_t *buffer, int length){
-    char *senderHandle = getHandle(clientSocket);
-    if (!senderHandle) {
-        return;
-    }
-
-    uint8_t destHandleLen = buffer[4 + strlen(senderHandle)];
-    char destHandle[100];
-    strncpy(destHandle, (char*)&buffer[5 + strlen(senderHandle)], destHandleLen);
-    destHandle[destHandleLen] = '\0';
-
-    int destSocket = findHandle(destHandle);
-    if (destSocket == -1) {
-        sendHandleError(clientSocket, destHandle);
-        return;
-    }
-
-    sendPDU(destSocket, buffer, length);
-	printf("Forwarded message from %s to %s\n", senderHandle, destHandle);
-
+// calls sendPDU and checks for errors
+void sendPacket(int socketNum, uint8_t *payloadBuf, int payloadLen){
+	if(sendPDU(socketNum, payloadBuf, payloadLen) < 0){
+		perror("Unable to send PDU");
+		exit(-1);
+	}
 }
 
-void sendHandleError(int clientSocket, const char *destHandle) {
-    uint8_t errorPacket[MAXBUF];
-    uint8_t flag = 7;  // Error flag
-    uint8_t destHandleLen = strlen(destHandle);
-    uint16_t totalLen = htons(3 + destHandleLen); // 3 bytes = (2-byte length + 1-byte flag)
+void forwardDm(int socketNum, uint8_t *msgBuffer, int msgLen){
+	int index = 1;		// start at 1 because 0 is the flag 
 
-    int index = 0;
+	// 1 byte client handle len
+	uint8_t clientHandleLen = msgBuffer[index++];
 
-    // Add 2-byte PDU length
-    memcpy(&errorPacket[index], &totalLen, 2);
-    index += 2;
+	// client handle name
+	char clientHandle[clientHandleLen];
+	memcpy(clientHandle, msgBuffer + index, clientHandleLen);
+	clientHandle[clientHandleLen] = '\0';
+	index += clientHandleLen;
 
-    // Add 1-byte flag
-    errorPacket[index++] = flag;
+	// num of destinations
+	uint8_t numOfDest = msgBuffer[index++];		// dont use just increment index 
 
-    // Add 1-byte destination handle length
-    errorPacket[index++] = destHandleLen;
+	// 1 byte len of dest handle
+	uint8_t destHandleLen = msgBuffer[index++];
+	
+	// dest handle name
+	char destHandle[destHandleLen];
+	memcpy(destHandle, msgBuffer + index, destHandleLen);
+	destHandle[destHandleLen] = '\0';
+	index += destHandleLen;
 
-    // Add destination handle
-    memcpy(&errorPacket[index], destHandle, destHandleLen);
-    index += destHandleLen;
+	// text message 
+	char txtMsg[MAXBUF];
+	int txtMsgLen = msgLen - index;
+	if(txtMsgLen > 0){
+		memcpy(txtMsg, msgBuffer + index, txtMsgLen);
+		txtMsg[txtMsgLen] = '\0';
+	}else{
+		txtMsg[0] = '\0';
+	}
 
-    // Send error message to the sender
-    sendPDU(clientSocket, errorPacket, ntohs(totalLen));
+	int destSocket = findHandle(destHandle);
 
-    printf("Error: Client with handle %s does not exist. Sent error to client on socket %d.\n", destHandle, clientSocket);
+	// this means there is no socket for this handle 
+	if(destSocket < 0){
+		handleDNE(socketNum, destHandle);
+	}else{
+		sendPacket(destSocket, msgBuffer, msgLen);
+	}
+}
+
+
+// for handles that dont exist
+void handleDNE(int socketNum, const char *destHandle){
+	// going to contain the message of the DNE
+	uint8_t dneMsg[MAXBUF];
+	int index = 0;
+	uint8_t flag = 7;
+	dneMsg[index++] = flag;
+
+	// dest handle
+	uint8_t destHandleLen = (uint8_t)strlen(destHandle);
+	dneMsg[index++] = destHandleLen;
+	memcpy(dneMsg + index, destHandle, destHandleLen);
+	index += destHandleLen;
+	sendPacket(socketNum, dneMsg, index); 
+}
+
+void forwardMulticast(int socketNum, uint8_t *msgBuffer, int msgLen){
+	int index = 1;
+
+	uint8_t clientHandleLen = msgBuffer[index++];
+	
+	// client handle name
+	char clientHandle[clientHandleLen];
+	memcpy(clientHandle, msgBuffer + index, clientHandleLen);
+	clientHandle[clientHandleLen] = '\0';
+	index += clientHandleLen;
+	uint8_t numOfHandles = msgBuffer[index++];
+
+	// add all the dest handles length and name
+	for(int i = 0; i < numOfHandles; i++){
+		uint8_t destHandleLen = msgBuffer[index++];
+		char destHandle[destHandleLen];
+		memcpy(destHandle, msgBuffer + index, destHandleLen);
+		destHandle[destHandleLen] = '\0';
+		index += destHandleLen;
+
+		int destSocket = findHandle(destHandle);
+		// this means there is no socket for this handle 
+		if(destSocket < 0){
+			handleDNE(socketNum, destHandle);
+		}else{
+			sendPacket(destSocket, msgBuffer, msgLen);
+		}
+	}
+}
+
+void sendHandles(int socketNum){
+	int index = 0;
+	uint8_t numOfHandleBuf[MAXBUF];
+	uint8_t flag = 11;
+	uint32_t numOfHandles = htonl((uint32_t)activeClients);
+	numOfHandleBuf[index++] = flag;
+
+	// printf("Flag is set to %d\n", flag);
+    memcpy(numOfHandleBuf + index, &numOfHandles, sizeof(numOfHandles));
+    index += sizeof(numOfHandles);
+	sendPacket(socketNum, numOfHandleBuf, index); 
+
+	// send flag 12 packets
+	Node *curr = getHead();
+
+	// if(curr == NULL){
+	// 	printf("Node is null\n");
+	// }
+
+	// go through linked list and copy the handles into buffer
+	while(curr != NULL){
+		index = 0;
+		flag = 12;
+		numOfHandleBuf[index++] = flag;
+		// printf("In the Node part flag should be %d\n", flag);
+		uint8_t handleLen = (uint8_t)strlen(curr->handleName);
+		numOfHandleBuf[index++] = handleLen;
+		memcpy(numOfHandleBuf + index, curr->handleName, handleLen);
+		index += handleLen;
+		sendPacket(socketNum, numOfHandleBuf, index);
+		curr = curr->next;
+	}
+
+	// send flag 13
+	flag = 13;
+	numOfHandleBuf[0] = flag;
+	// printf("Finished with list so flag shoulld be %d\n", flag);
+	sendPacket(socketNum, numOfHandleBuf, 1);
+}
+
+void forwardBroadcast(uint8_t *msgBuffer, int msgLen){
+	int index = 1;
+	uint8_t clientHandleLen = msgBuffer[index++];
+	
+	// client handle name
+	char clientHandle[clientHandleLen];
+	memcpy(clientHandle, msgBuffer + index, clientHandleLen);
+	clientHandle[clientHandleLen] = '\0';
+	index += clientHandleLen;
+
+	// text message
+	char txtMsg[MAXBUF];
+	int txtMsgLen = msgLen - index;
+	if(txtMsgLen > 0){
+		memcpy(txtMsg, msgBuffer + index, txtMsgLen);
+		txtMsg[txtMsgLen] = '\0';
+	}else{
+		txtMsg[0] = '\0';
+	}
+
+	Node *curr = getHead();
+	while(curr != NULL){
+		// ignore the handle that is broadcasting 
+		if(strcmp(curr->handleName, clientHandle) == 0){
+			curr = curr->next;
+			continue;
+		}
+		int socketNum = findHandle(curr->handleName);
+		sendPacket(socketNum, msgBuffer, msgLen);
+		curr = curr->next;
+	}
 }
